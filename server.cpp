@@ -50,14 +50,20 @@ int server_on_timer_multi(conn_info_t &conn_info)  // for server. called when a 
         }*/
         // dont need to do this at server,conn_manger will clear expired connections
 
-        if (get_current_time() - conn_info.last_hb_sent_time < heartbeat_interval) {
+        u32_t hb_iv = heartbeat_interval;
+        if (g_hb_jitter) hb_iv = heartbeat_interval - 150 + (get_true_random_number() % 300);
+        if (get_current_time() - conn_info.last_hb_sent_time < hb_iv) {
             return 0;
         }
 
         if (hb_mode == 0)
             send_safer(conn_info, 'h', hb_buf, 0);  /////////////send
-        else
-            send_safer(conn_info, 'h', hb_buf, hb_len);
+        else {
+            int this_hb_len = hb_len;
+            if (!hb_len_was_set) this_hb_len = 80 + (get_true_random_number() % 1320);
+            for (int z = 0; z < this_hb_len; z++) hb_buf[z] = (char)(get_true_random_number() % 256);
+            send_safer(conn_info, 'h', hb_buf, this_hb_len);
+        }
         conn_info.last_hb_sent_time = get_current_time();
 
         mylog(log_debug, "heart beat sent<%x,%x>\n", conn_info.my_id, conn_info.oppsite_id);
@@ -233,8 +239,12 @@ int server_on_raw_recv_pre_ready(conn_info_t &conn_info, char *ip_port, u32_t tm
 
         if (hb_mode == 0)
             send_safer(conn_info, 'h', hb_buf, 0);  /////////////send
-        else
-            send_safer(conn_info, 'h', hb_buf, hb_len);
+        else {
+            int this_hb_len = hb_len;
+            if (!hb_len_was_set) this_hb_len = 80 + (get_true_random_number() % 1320);
+            for (int z = 0; z < this_hb_len; z++) hb_buf[z] = (char)(get_true_random_number() % 256);
+            send_safer(conn_info, 'h', hb_buf, this_hb_len);
+        }
 
         mylog(log_info, "[%s]changed state to server_ready\n", ip_port);
         conn_info.blob->anti_replay.re_init();
@@ -294,8 +304,12 @@ int server_on_raw_recv_pre_ready(conn_info_t &conn_info, char *ip_port, u32_t tm
             // ori_conn_info.blob->anti_replay.re_init();
             if (hb_mode == 0)
                 send_safer(ori_conn_info, 'h', hb_buf, 0);  /////////////send
-            else
-                send_safer(ori_conn_info, 'h', hb_buf, hb_len);
+            else {
+                int this_hb_len = hb_len;
+                if (!hb_len_was_set) this_hb_len = 80 + (get_true_random_number() % 1320);
+                for (int z = 0; z < this_hb_len; z++) hb_buf[z] = (char)(get_true_random_number() % 256);
+                send_safer(ori_conn_info, 'h', hb_buf, this_hb_len);
+            }
 
             ori_conn_info.last_hb_recv_time = get_current_time();
 

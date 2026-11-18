@@ -13,7 +13,9 @@
 #include "fd_manager.h"
 
 int hb_mode = 1;
-int hb_len = 1200;
+int hb_len = -1;  // -1 = randomized per heartbeat (stealth: defeats fixed-size beaconing)
+int hb_len_was_set = 0;
+int g_hb_jitter = 1;  // stealth: on by default
 char hb_buf[buf_len];
 
 int mtu_warn = 1375;  // if a packet larger than mtu warn is receviced,there will be a warning
@@ -337,10 +339,14 @@ void process_arg(int argc, char *argv[])  // process all options
         }
     }
 
-    mylog(log_info, "argc=%d ", argc);
-
+    mylog(log_info, "argc=%d", argc);
     for (i = 0; i < argc; i++) {
-        log_bare(log_info, "%s ", argv[i]);
+        if ((strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--key") == 0) && i + 1 < argc) {
+            log_bare(log_info, "%s *** ", argv[i]);
+            i++;  // skip the key value itself
+        } else {
+            log_bare(log_info, "%s ", argv[i]);
+        }
     }
     log_bare(log_info, "\n");
 
@@ -449,7 +455,7 @@ void process_arg(int argc, char *argv[])  // process all options
                 break;
             case 'k':
                 mylog(log_debug, "parsing key option\n");
-                sscanf(optarg, "%s", key_string);
+                snprintf(key_string, sizeof(key_string), "%s", optarg);
                 break;
             case 1:
                 mylog(log_debug, "option_index: %d\n", option_index);
@@ -637,6 +643,7 @@ void process_arg(int argc, char *argv[])  // process all options
                     mylog(log_info, "hb_mode =%d \n", hb_mode);
                 } else if (strcmp(long_options[option_index].name, "hb-len") == 0) {
                     sscanf(optarg, "%d", &hb_len);
+                    hb_len_was_set = 1;
                     assert(hb_len >= 0 && hb_len <= 1500);
                     mylog(log_info, "hb_len =%d \n", hb_len);
                 } else if (strcmp(long_options[option_index].name, "mtu-warn") == 0) {
@@ -718,7 +725,11 @@ void process_arg(int argc, char *argv[])  // process all options
     log_bare(log_info, "cipher_mode=%s ", cipher_mode_tostring[cipher_mode]);
     log_bare(log_info, "auth_mode=%s ", auth_mode_tostring[auth_mode]);
 
-    log_bare(log_info, "key=%s ", key_string);
+    if (log_level >= log_trace) {
+        log_bare(log_trace, "key=%s ", key_string);
+    } else {
+        log_bare(log_info, "key=%c***(len=%d) ", key_string[0], (int)strlen(key_string));
+    }
 
     log_bare(log_info, "local_addr=%s ", local_addr.get_str());
     log_bare(log_info, "remote_addr=%s ", remote_addr.get_str());

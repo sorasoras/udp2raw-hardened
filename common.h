@@ -162,6 +162,7 @@ const int max_addr_len = 100;
 extern int force_socket_buf;
 
 extern int g_fix_gro;
+extern int g_hb_jitter;  // stealth: jitter heartbeat cadence
 
 /*
 struct ip_port_t

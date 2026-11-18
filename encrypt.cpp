@@ -52,13 +52,17 @@ int aes128cfb_old = 0;
 
 // TODO key negotiation and forward secrecy
 
+static void print_crypto_advisory();
+
 int my_init_keys(const char *user_passwd, int is_client) {
     char tmp[1000] = "";
     int len = strlen(user_passwd);
 
-    strcat(tmp, user_passwd);
-
-    strcat(tmp, "key1");
+    if (len <= 0 || len > 900) {
+        mylog(log_fatal, "key length must be 1..900 bytes (got %d\n", len);
+        myexit(-1);
+    }
+    snprintf(tmp, sizeof(tmp), "%skey1", user_passwd);
 
     md5((uint8_t *)tmp, strlen(tmp), (uint8_t *)normal_key);
 
@@ -101,6 +105,7 @@ int my_init_keys(const char *user_passwd, int is_client) {
         assert(hkdf_sha256_expand(pbkdf2_output1, 32, (unsigned char *)gro_info, strlen(gro_info), (unsigned char *)gro_xor, 256) == 0);
     }
 
+    print_crypto_advisory();
     print_binary_chars(normal_key, 16);
     print_binary_chars((char *)hmac_key_encrypt, hmac_key_len);
     print_binary_chars((char *)hmac_key_decrypt, hmac_key_len);
@@ -180,6 +185,15 @@ int auth_hmac_sha1_cal(const char *data, char *output, int &len) {
     return 0;
 }
 
+// constant-time comparison for MAC/tag verification (avoids timing side-channel)
+int ct_memcmp(const void *a_, const void *b_, size_t n) {
+    const unsigned char *a = (const unsigned char *)a_;
+    const unsigned char *b = (const unsigned char *)b_;
+    unsigned char d = 0;
+    for (size_t i = 0; i < n; i++) d |= a[i] ^ b[i];
+    return d;  // 0 when equal
+}
+
 int auth_hmac_sha1_verify(const char *data, int &len) {
     mylog(log_trace, "auth_hmac_sha1_verify() is called\n");
     if (len < 20) {
@@ -219,7 +233,7 @@ int auth_simple_verify(const char *data, int &len) {
     unsigned char res[8];
     len -= 8;
     simple_hash((unsigned char *)data, len, res);
-    if (memcmp(res, data + len, 8) != 0)
+    if (ct_memcmp(res, data + len, 8) != 0)
         return -1;
     return 0;
 }
@@ -526,6 +540,24 @@ int decrypt_AE(const char *data, char *output, int &len /*,char * key*/) {
         return -1;
     }
     return 0;
+}
+
+static void print_crypto_advisory() {
+    if (auth_mode != auth_hmac_sha1) {
+        mylog(log_warn, "============================================================\n");
+        mylog(log_warn, "SECURITY: auth mode is NOT hmac_sha1.\n");
+        if (auth_mode == auth_md5 || auth_mode == auth_simple || auth_mode == auth_crc32) {
+            mylog(log_warn, "SECURITY: md5/simple/crc32 are UNKEYED checksums: they provide\n");
+            mylog(log_warn, "SECURITY: NO message authentication. Combined with CBC malleability\n");
+            mylog(log_warn, "SECURITY: an active attacker can corrupt/redirect traffic.\n");
+        }
+        mylog(log_warn, "SECURITY: recommended: --auth-mode hmac_sha1 --cipher-mode aes128cbc\n");
+        mylog(log_warn, "============================================================\n");
+    }
+    if (cipher_mode == cipher_xor || cipher_mode == cipher_none) {
+        mylog(log_warn, "SECURITY: cipher mode %s provides no real confidentiality\n",
+              cipher_mode_tostring[cipher_mode]);
+    }
 }
 
 int my_encrypt(const char *data, char *output, int &len /*,char * key*/) {

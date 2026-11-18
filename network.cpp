@@ -34,6 +34,21 @@ char if_name[100] = "";
 char dev[100] = "";
 
 unsigned short g_ip_id_counter = 0;
+
+// --- stealth: plausible TCP timestamp ticks (uptime-like) instead of epoch seconds.
+// Real stacks carry a monotonically increasing tick (HZ-based), NOT unix epoch.
+u32_t g_ts_base_ticks = 0;      // random per-process start
+u64_t g_ts_start_ms = 0;        // process start time in ms
+void init_tcp_ts()
+{
+    g_ts_base_ticks = get_true_random_number() % 400000000u;  // plausible "uptime"
+    g_ts_start_ms = get_current_time();
+}
+u32_t get_tcp_ts_ticks()
+{
+    u32_t elapsed = (u32_t)((get_current_time() - g_ts_start_ms));  // ms
+    return g_ts_base_ticks + elapsed;  // 1000 ticks/sec, monotonic, wraps like real uptime
+}
 #ifdef UDP2RAW_LINUX
 unsigned char dest_hw_addr[sizeof(sockaddr_ll::sll_addr)] =
     {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0};
@@ -372,6 +387,7 @@ int init_raw_socket() {
     assert(raw_ip_version == AF_INET || raw_ip_version == AF_INET6);
 
     g_ip_id_counter = get_true_random_number() % 65535;
+    init_tcp_ts();
     if (lower_level == 0) {
         raw_send_fd = socket(raw_ip_version, SOCK_RAW, IPPROTO_RAW);  // IPPROTO_TCP??
 
@@ -571,6 +587,7 @@ int init_raw_socket() {
     ////////////////////////////////////////////////////////////////////////////////
 
     g_ip_id_counter = get_true_random_number() % 65535;
+    init_tcp_ts();
 
     /*
     if(lower_level==0)
@@ -1374,6 +1391,10 @@ int recv_raw_ip(raw_info_t &raw_info, char *&payload, int &payloadlen) {
     unsigned short iphdrlen;
     int ip_len;
     if (raw_ip_version == AF_INET) {
+        if (iph->ihl < 5) {
+            mylog(log_debug, "iph ihl<5, dropped\n");
+            return -1;
+        }
         recv_info.new_src_ip.v4 = iph->saddr;
         recv_info.new_dst_ip.v4 = iph->daddr;
         recv_info.protocol = iph->protocol;
@@ -1662,7 +1683,7 @@ int send_raw_tcp(raw_info_t &raw_info, const char *payload, int payloadlen) {  /
         //*(u32_t*) (&send_raw_tcp_buf[i]) = htonl(
         //	(u32_t) get_current_time());
 
-        u32_t ts = htonl((u32_t)get_current_time());
+        u32_t ts = htonl(get_tcp_ts_ticks());
         memcpy(&send_raw_tcp_buf[i], &ts, sizeof(ts));
 
         i += 4;
@@ -1692,7 +1713,7 @@ int send_raw_tcp(raw_info_t &raw_info, const char *payload, int payloadlen) {  /
         //*(u32_t*) (&send_raw_tcp_buf[i]) = htonl(
         //	(u32_t) get_current_time());
 
-        u32_t ts = htonl((u32_t)get_current_time());
+        u32_t ts = htonl(get_tcp_ts_ticks());
         memcpy(&send_raw_tcp_buf[i], &ts, sizeof(ts));
 
         i += 4;
@@ -2188,12 +2209,12 @@ int recv_raw_tcp(raw_info_t &raw_info, char *&payload, int &payloadlen) {
 
     if (!(tcphdrlen > 0 && tcphdrlen <= 60)) {
         mylog(log_debug, "tcph error\n");
-        return 0;
+        return -1;
     }
 
     if (tcphdrlen > ip_payloadlen) {
         mylog(log_debug, "error,tcphdrlen >ip_payloadlen\n");
-        return 0;
+        return -1;
     }
 
     if (tcph->dest != ntohs(uint16_t(filter_port))) {
@@ -2237,8 +2258,11 @@ int recv_raw_tcp(raw_info_t &raw_info, char *&payload, int &payloadlen) {
     printf("\n");*/
 
     if (tcp_chk != 0) {
-        mylog(log_debug, "tcp_chk:%x, tcp checksum failed, ignored\n", tcp_chk);
-        // return -1;
+        if (!g_fix_gro) {
+            mylog(log_debug, "tcp_chk:%x, tcp checksum failed, dropped\n", tcp_chk);
+            return -1;
+        }
+        mylog(log_debug, "tcp_chk:%x, tcp checksum failed, ignored (fix-gro mode)\n", tcp_chk);
     }
 
     char *tcp_begin = ip_payload;  // ip packet's data part

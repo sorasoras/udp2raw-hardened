@@ -14,6 +14,7 @@
 
 extern int hb_mode;
 extern int hb_len;
+extern int hb_len_was_set;
 extern char hb_buf[buf_len];
 
 extern int mtu_warn;
