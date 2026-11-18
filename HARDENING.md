@@ -69,14 +69,14 @@ The upstream Windows path had three bugs that each broke or weakened the client:
 - Crypto/key derivation is unchanged from upstream — a hardened client pairs with an
   unpatched server and vice versa.
 
-## Prebuilt binaries (`dist/`)
+## Prebuilt binaries (GitHub Releases)
 
 | File | Built from | Notes |
 |---|---|---|
 | `udp2raw-linux-x64` | this source, `make all` | static, stripped, hardened flags |
-| `udp2raw_win64.exe` | same source, mingw-w64 x86_64 cross-compile | static, needs Npcap |
+| `udp2raw-win64.exe` (release) | same source, mingw-w64 x86_64 cross-compile | static, needs Npcap |
 
-sha256 in `dist/sha256sums.txt`. Linux binary requires root or `cap_net_raw`
+sha256 sums are attached to the release. Linux binary requires root or `cap_net_raw`
 (faketcp mode also uses iptables via `-a`); Windows exe needs **Npcap** with
 WinPcap-compatible mode.
 
