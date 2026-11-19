@@ -9,6 +9,10 @@
 #include "log.h"
 #include "misc.h"
 
+#if defined(UDP2RAW_MP) && defined(_WIN32)
+#include <iphlpapi.h>
+#endif
+
 int g_fix_gro = 0;
 
 int raw_recv_fd = -1;
@@ -104,6 +108,118 @@ pthread_t pcap_recv_thread;
 
 struct bpf_program g_filter;
 long long g_filter_compile_cnt = 0;
+
+#endif
+
+#if defined(UDP2RAW_MP) && defined(_WIN32)
+
+static const char *mac_to_str(const unsigned char *mac, char *out) {
+    sprintf(out, "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return out;
+}
+
+//find the MAC of the adapter that actually owns ip (network byte order)
+static int get_own_mac_by_ip(u32_t ip, unsigned char mac[6], DWORD *if_index_out) {
+    ULONG size = 0;
+    DWORD ret = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, NULL, NULL, &size);
+    if (ret != ERROR_BUFFER_OVERFLOW || size == 0) {
+        return -1;
+    }
+    IP_ADAPTER_ADDRESSES *buf = (IP_ADAPTER_ADDRESSES *)malloc(size);
+    if (buf == NULL) {
+        return -1;
+    }
+    ret = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, NULL, buf, &size);
+    int found = -1;
+    if (ret == NO_ERROR) {
+        for (IP_ADAPTER_ADDRESSES *ad = buf; ad != NULL; ad = ad->Next) {
+            //skip adapters without a usable ethernet address (wintun, disabled, etc)
+            if (ad->PhysicalAddressLength != 6) {
+                continue;
+            }
+            if (ad->OperStatus != IfOperStatusUp) {
+                continue;
+            }
+            for (IP_ADAPTER_UNICAST_ADDRESS *ua = ad->FirstUnicastAddress; ua != NULL; ua = ua->Next) {
+                if (ua->Address.lpSockaddr == NULL || ua->Address.lpSockaddr->sa_family != AF_INET) {
+                    continue;
+                }
+                struct sockaddr_in *sin = (struct sockaddr_in *)ua->Address.lpSockaddr;
+                if (sin->sin_addr.s_addr == ip) {
+                    memcpy(mac, ad->PhysicalAddress, 6);
+                    if (if_index_out != NULL) {
+                        *if_index_out = ad->IfIndex;
+                    }
+                    found = 0;
+                    break;
+                }
+            }
+            if (found == 0) {
+                break;
+            }
+        }
+    }
+    free(buf);
+    return found;
+}
+
+//resolve the next hop MAC towards dst, using the adapter that owns src
+static int get_next_hop_mac(u32_t src, u32_t dst, unsigned char mac[6]) {
+    u32_t next_hop = 0;
+    MIB_IPFORWARDROW row;
+    memset(&row, 0, sizeof(row));
+    if (GetBestRoute(dst, src, &row) == NO_ERROR) {
+        next_hop = row.dwForwardNextHop;
+    }
+    if (next_hop == 0) {
+        next_hop = dst;
+    }
+
+    ULONG len = 6;
+    if (SendARP(next_hop, src, mac, &len) == NO_ERROR && len == 6) {
+        return 0;
+    }
+    //some stacks refuse a source-pinned query, retry with the default source
+    len = 6;
+    if (SendARP(next_hop, 0, mac, &len) == NO_ERROR && len == 6) {
+        return 0;
+    }
+    return -1;
+}
+
+//build the 14 byte ethernet header deterministically instead of stealing
+//whatever frame the pcap filter captured first
+static int build_eth_header(u32_t src, u32_t dst) {
+    unsigned char src_mac[6];
+    unsigned char dst_mac[6];
+    DWORD if_index = 0;
+    char src_str[32];
+    char dst_str[32];
+
+    struct in_addr src_addr;
+    struct in_addr dst_addr;
+    src_addr.s_addr = src;
+    dst_addr.s_addr = dst;
+
+    if (get_own_mac_by_ip(src, src_mac, &if_index) != 0) {
+        mylog(log_warn, "can not find the adapter owning ip %s\n", inet_ntoa(src_addr));
+        return -1;
+    }
+    if (get_next_hop_mac(src, dst, dst_mac) != 0) {
+        mylog(log_warn, "can not resolve next hop mac towards %s\n", inet_ntoa(dst_addr));
+        return -1;
+    }
+
+    unsigned char *hdr = (unsigned char *)pcap_header_buf;
+    memcpy(hdr, dst_mac, 6);
+    memcpy(hdr + 6, src_mac, 6);
+    hdr[12] = 0x08;
+    hdr[13] = (raw_ip_version == AF_INET6) ? 0xdd : 0x00;
+
+    pcap_header_captured = 1;
+    mylog(log_info, "eth header built: dst %s src %s, if_index %u\n", mac_to_str(dst_mac, dst_str), mac_to_str(src_mac, src_str), (unsigned int)if_index);
+    return 0;
+}
 
 #endif
 
@@ -578,6 +694,16 @@ int init_raw_socket() {
         printf("Error setting filter - %s\n", pcap_geterr(pcap_handle));
         myexit(-1);
     }
+
+#if defined(UDP2RAW_MP) && defined(_WIN32)
+    //build the ethernet header from the routing table instead of waiting for the
+    //first captured frame, which may belong to another adapter entirely
+    if (send_with_pcap && pcap_link_header_len == 14 && raw_ip_version == AF_INET) {
+        if (build_eth_header(tmp_addr.inner.ipv4.sin_addr.s_addr, remote_addr.inner.ipv4.sin_addr.s_addr) != 0) {
+            mylog(log_warn, "falling back to capturing the link header from the first packet\n");
+        }
+    }
+#endif
 
     ///////////////////////////////////////////////////////////////new thread created here
     if (pthread_create(&pcap_recv_thread, NULL, pcap_recv_thread_entry, 0)) {
