@@ -6,6 +6,16 @@
  */
 
 #include "connection.h"
+static inline int seq_lt(u32_t a, u32_t b);
+static inline int seq_le(u32_t a, u32_t b);
+static inline int seq_gt(u32_t a, u32_t b);
+int tcpemul_send_ack(conn_info_t &conn_info);
+int tcpemul_on_recv_frame(conn_info_t &conn_info);
+int tcpemul_record_sent(conn_info_t &conn_info, const char *pkt, int len, u32_t seq_start);
+int tcpemul_retire_acked(conn_info_t &conn_info);
+int tcpemul_retx_scan(conn_info_t &conn_info);
+int tcpemul_fast_retx(conn_info_t &conn_info);
+
 #include "encrypt.h"
 #include "fd_manager.h"
 
@@ -440,9 +450,14 @@ int send_safer(conn_info_t &conn_info, char type, const char *data, int len)  //
         }
     }
 
+    u32_t tcpemul_seq_start = conn_info.raw_info.send_info.seq;
     if (send_raw0(conn_info.raw_info, send_data_buf2, new_len) != 0) return -1;
 
     if (after_send_raw0(conn_info.raw_info) != 0) return -1;
+
+    if (type == 'd' && new_len > 0) {
+        tcpemul_record_sent(conn_info, send_data_buf2, new_len, tcpemul_seq_start);
+    }
 
     return 0;
 }
@@ -494,6 +509,11 @@ int reserved_parse_safer(conn_info_t &conn_info, const char *input, int input_le
 
     if (conn_info.blob->anti_replay.is_vaild(h_seq) != 1) {
         mylog(log_debug, "dropped replay packet\n");
+        // hardened fork: a replay-window drop of a data packet means our
+        // ack was lost and the peer retransmitted. re-ack so it stops.
+        if (conn_info.blob->tcp_emul.rcv_valid && seq_le(h_seq, conn_info.blob->tcp_emul.rcv_nxt)) {
+            return -2;
+        }
         return -1;
     }
 
@@ -531,6 +551,9 @@ int reserved_parse_safer(conn_info_t &conn_info, const char *input, int input_le
         myexit(-1);
     }
 
+    if (conn_info.raw_info.recv_info.ack_seq_counter >= 3) {
+        tcpemul_fast_retx(conn_info);  // fast retransmit on 3 dup-acks
+    }
     if (after_recv_raw0(conn_info.raw_info) != 0) return -1;  // TODO might need to move this function to somewhere else after --fix-gro is introduced
 
     return 0;
@@ -545,10 +568,141 @@ int recv_safer_notused(conn_info_t &conn_info, char &type, char *&data, int &len
     // static char recv_data_buf[buf_len];
 
     if (recv_raw0(conn_info.raw_info, recv_data, recv_len) != 0) return -1;
+    if (tcpemul_on_recv_frame(conn_info) == -2) return -2;  // fully-old frame: re-acked, skip parse
 
     return reserved_parse_safer(conn_info, recv_data, recv_len, type, data, len);
 }
 
+// ================= fake-TCP behaviour emulation (hardened fork) =================
+// Emulates the TCP behaviours a mid-path observer expects: cumulative ACKs,
+// duplicate ACKs on gaps, real byte retransmission with RTO backoff and fast
+// retransmit on 3 dup-ACKs, and re-ACK when a retransmission hits a replay-
+// window duplicate (meaning our ack was lost).
+//
+// Data-plane safety: retransmitted packets carry the SAME inner anti-replay
+// seq, so a peer that already processed them drops the copy in its replay
+// window. Nothing is ever duplicated into user data.
+//
+// Wire-compatible with unpatched peers: our retransmissions are ordinary data
+// packets to them; our dup-ACKs are ordinary frames; fast retransmit degrades
+// to RTO-only against unpatched peers.
+
+static inline int seq_lt(u32_t a, u32_t b) { return (int)(a - b) < 0; }
+static inline int seq_le(u32_t a, u32_t b) { return (int)(a - b) <= 0; }
+static inline int seq_gt(u32_t a, u32_t b) { return (int)(a - b) > 0; }
+
+static const int tcpemul_rto_base = 800;      // ms; ack cadence can reach hb interval (600 ms)
+static const int tcpemul_max_retries = 4;
+static const size_t tcpemul_max_buf = 192;    // unacked segment cap (< anti-replay window 4000)
+
+int tcpemul_send_ack(conn_info_t &conn_info) {
+    if (conn_info.state.server_current_state != server_ready
+        && conn_info.state.client_current_state != client_ready) return -1;
+    return send_safer(conn_info, 'h', 0, 0);
+}
+
+int tcpemul_on_recv_frame(conn_info_t &conn_info) {
+    // runs BEFORE after_recv_raw0, so send_info.ack_seq is still the contiguous
+    // receive position as of the previous frame (mode 3 advances it in-order only).
+    if (raw_mode != mode_faketcp) return 0;
+    if (seq_mode != 3 && seq_mode != 4) return 0;
+    packet_info_t &recv_info = conn_info.raw_info.recv_info;
+    packet_info_t &send_info = conn_info.raw_info.send_info;
+    tcp_emul_t &te = conn_info.blob->tcp_emul;
+    u32_t seq = recv_info.seq;
+    u32_t len = (u32_t)recv_info.data_len;
+    if (len == 0) return 0;  // pure ack carrier
+    u32_t ackpos = send_info.ack_seq;
+    if (!seq_gt(seq, ackpos) && !seq_lt(seq, ackpos)) return 0;  // in order (seq == ackpos)
+    if (seq_gt(seq, ackpos)) {    // gap ahead of us
+        if (te.gap_base != ackpos) { te.gap_base = ackpos; te.gap_dups = 0; }
+        if (te.gap_dups < 5) {
+            tcpemul_send_ack(conn_info);   // dup-ack: ack stays at the gap position
+            te.gap_dups++;
+        }
+        return 0;  // out-of-order frame is still processed (UDP semantics)
+    }
+    if (seq_gt(seq + len, ackpos)) return 0;  // partial overlap: process, ack unchanged
+    // fully old: retransmission of data we already have -> re-ack
+    tcpemul_send_ack(conn_info);
+    return -2;
+}
+
+int tcpemul_fast_retx(conn_info_t &conn_info) {
+    // immediate retransmit of the segment at the dup-acked position (3 dup-acks)
+    tcp_emul_t &te = conn_info.blob->tcp_emul;
+    if (te.retx_q.empty()) return 0;
+    retx_entry_t &e = te.retx_q.front();
+    u32_t ack = conn_info.raw_info.recv_info.ack_seq;
+    if (e.seq_start != ack) return 0;
+    u64_t now = get_current_time();
+    if (now - e.last_ms < 100) return 0;  // pacing
+    u32_t saved_seq = conn_info.raw_info.send_info.seq;
+    conn_info.raw_info.send_info.seq = e.seq_start;
+    conn_info.raw_info.send_info.psh = 1;
+    int r = send_raw0(conn_info.raw_info, e.pkt.data(), (int)e.pkt.size());
+    if (r == 0) after_send_raw0(conn_info.raw_info);
+    conn_info.raw_info.send_info.seq = saved_seq;
+    e.retries++;
+    e.last_ms = now;
+    conn_info.raw_info.recv_info.ack_seq_counter = 0;
+    return 0;
+}
+int tcpemul_record_sent(conn_info_t &conn_info, const char *pkt, int len, u32_t seq_start) {
+    if (raw_mode != mode_faketcp) return 0;
+    if (len <= 0) return 0;
+    tcp_emul_t &te = conn_info.blob->tcp_emul;
+    retx_entry_t e;
+    e.pkt.assign(pkt, pkt + len);
+    e.seq_start = seq_start;
+    e.seq_end = seq_start + (u32_t)len;
+    e.first_ms = e.last_ms = get_current_time();
+    e.retries = 0;
+    if (te.retx_q.size() >= tcpemul_max_buf) te.retx_q.pop_front();
+    te.retx_q.push_back(e);
+    return 0;
+}
+
+int tcpemul_retire_acked(conn_info_t &conn_info) {
+    if (raw_mode != mode_faketcp) return 0;
+    tcp_emul_t &te = conn_info.blob->tcp_emul;
+    u32_t ack = conn_info.raw_info.recv_info.ack_seq;
+    // scan-based: entries may be out of order in the queue (new data is sent
+    // while old segments await retransmission), so pop any acked entry,
+    // not just the front one.
+    for (auto it = te.retx_q.begin(); it != te.retx_q.end();) {
+        if (seq_le(it->seq_end, ack)) it = te.retx_q.erase(it);
+        else ++it;
+    }
+    return 0;
+}
+
+int tcpemul_retx_scan(conn_info_t &conn_info) {
+    if (raw_mode != mode_faketcp) return 0;
+    if (conn_info.state.server_current_state != server_ready
+        && conn_info.state.client_current_state != client_ready) return 0;
+    tcp_emul_t &te = conn_info.blob->tcp_emul;
+    u64_t now = get_current_time();
+    int sent = 0;
+    for (auto &e : te.retx_q) {
+        if (e.retries >= tcpemul_max_retries) continue;
+        int rto = tcpemul_rto_base << e.retries;
+        if (now - e.last_ms < (u64_t)rto) continue;
+        u32_t saved_seq = conn_info.raw_info.send_info.seq;
+        conn_info.raw_info.send_info.seq = e.seq_start;
+        conn_info.raw_info.send_info.psh = 1;
+        if (send_raw0(conn_info.raw_info, e.pkt.data(), (int)e.pkt.size()) == 0) {
+            after_send_raw0(conn_info.raw_info);
+            e.retries++;
+            e.last_ms = now;
+            sent++;
+        }
+        conn_info.raw_info.send_info.seq = saved_seq;
+        if (sent >= 8) break;  // bound work per tick
+    }
+    return 0;
+}
+// ===============================================================================
 int recv_safer_multi(conn_info_t &conn_info, vector<char> &type_arr, vector<string> &data_arr)  /// safer transfer function with anti-replay,when mutually verification is done.
 {
     packet_info_t &send_info = conn_info.raw_info.send_info;

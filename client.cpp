@@ -25,6 +25,8 @@ int client_on_timer(conn_info_t &conn_info)  // for client. called when a timer 
     packet_info_t &recv_info = conn_info.raw_info.recv_info;
     raw_info_t &raw_info = conn_info.raw_info;
     conn_info.blob->conv_manager.c.clear_inactive();
+    tcpemul_retire_acked(conn_info);
+    tcpemul_retx_scan(conn_info);
     mylog(log_trace, "timer!\n");
 
     mylog(log_trace, "roller my %d,oppsite %d,%lld\n", int(conn_info.my_roller), int(conn_info.oppsite_roller), conn_info.last_oppsite_roller_time);

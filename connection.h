@@ -8,6 +8,9 @@
 #ifndef CONNECTION_H_
 #define CONNECTION_H_
 
+#include <deque>
+#include <vector>
+
 extern int disable_anti_replay;
 
 #include "connection.h"
@@ -188,6 +191,28 @@ int clear_inactive(char * ip_port=0);
 int clear_inactive0(char * ip_port);*/
 };  // g_conv_manager;
 
+    struct retx_entry_t {
+        std::vector<char> pkt;  // exact wire bytes of the encrypted inner packet
+        u32_t seq_start;        // fake-tcp seq of first byte
+        u32_t seq_end;          // exclusive
+        u64_t first_ms, last_ms;
+        int retries;
+};
+struct tcp_emul_t {
+        // receiver side (cumulative ack)
+        u32_t rcv_nxt;
+        int rcv_valid;
+        u32_t gap_base;
+        int gap_dups;
+        // sender side
+        std::deque<retx_entry_t> retx_q;
+        tcp_emul_t() { rcv_nxt = 0; rcv_valid = 0; gap_base = 0; gap_dups = 0; }
+        void re_init() {
+            rcv_nxt = 0; rcv_valid = 0; gap_base = 0; gap_dups = 0;
+            retx_q.clear();
+        }
+};
+
 struct blob_t : not_copy_able_t  // used in conn_info_t.
 {
     union tmp_union_t  // conv_manager_t is here to avoid copying when a connection is recovered
@@ -214,6 +239,10 @@ struct blob_t : not_copy_able_t  // used in conn_info_t.
     } conv_manager;
 
     anti_replay_t anti_replay;  // anti_replay_t is here bc its huge,its allocation is delayed.
+
+
+    // ---- fake-TCP behaviour emulation (hardened fork) ----
+    tcp_emul_t tcp_emul;
 };
 struct conn_info_t  // stores info for a raw connection.for client ,there is only one connection,for server there can be thousand of connection since server can
 // handle multiple clients
@@ -305,6 +334,12 @@ int recv_bare(raw_info_t &raw_info, char *&data, int &len);  // recv function wi
 int send_handshake(raw_info_t &raw_info, my_id_t id1, my_id_t id2, my_id_t id3);         // a warp for send_bare for sending handshake(this is not tcp handshake) easily
 int send_safer(conn_info_t &conn_info, char type, const char *data, int len);            // safer transfer function with anti-replay,when mutually verification is done.
 int send_data_safer(conn_info_t &conn_info, const char *data, int len, u32_t conv_num);  // a wrap for  send_safer for transfer data.
+
+// fake-TCP behaviour emulation (hardened fork)
+int tcpemul_on_recv_frame(conn_info_t &conn_info);            // rcv_nxt tracking + dup-ack/re-ack; returns -2 to skip parse
+int tcpemul_record_sent(conn_info_t &conn_info, const char *pkt, int len, u32_t seq_start);
+int tcpemul_retire_acked(conn_info_t &conn_info);
+int tcpemul_retx_scan(conn_info_t &conn_info);
 // int reserved_parse_safer(conn_info_t &conn_info,const char * input,int input_len,char &type,char* &data,int &len);//subfunction for recv_safer,allow overlap
 
 // int recv_safer(conn_info_t &conn_info,char &type,char* &data,int &len);///safer transfer function with anti-replay,when mutually verification is done.

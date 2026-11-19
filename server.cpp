@@ -33,6 +33,8 @@ int server_on_timer_multi(conn_info_t &conn_info)  // for server. called when a 
     raw_info_t &raw_info = conn_info.raw_info;
 
     assert(conn_info.state.server_current_state == server_ready);
+    tcpemul_retire_acked(conn_info);
+    tcpemul_retx_scan(conn_info);
 
     if (conn_info.state.server_current_state == server_ready) {
         conn_info.blob->conv_manager.s.clear_inactive(ip_port);

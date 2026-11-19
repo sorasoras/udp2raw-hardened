@@ -102,9 +102,40 @@ Then point the hysteria2 client at `127.0.0.1:3333` (UDP) as if it were the serv
 On a UDP-hostile line this traded ~50% of peak throughput for a working, noticeably
 more responsive connection versus a dead UDP path; measure on your own line.
 
-## Known limitations (inherited from upstream)
+## Loss-recovery emulation (`feature/tcp-loss-emulation`)
 
-- Fake TCP does not retransmit — long-running traffic analysis can detect that.
+Plain upstream fake TCP never retransmits: sequence numbers advance with zero
+retransmissions, no duplicate ACKs, and an ACK for every packet. On a lossy path a
+real TCP flow is continuously recovering, so its absence is a clean classifier.
+
+That branch adds, per connection:
+
+| Mechanism | Behaviour |
+|---|---|
+| Retransmit | outgoing data frames buffered (encrypted wire bytes, cap 192); the timer resends unACKed segments at an 800 ms RTO doubling to 6.4 s, max 4 tries, with the original seq range and fresh ack/timestamp/window |
+| Cumulative ACK | ACK stays at the contiguous receive position; a gap holds it there while out-of-order frames are still delivered |
+| Dup-ACK | up to 5 ACK-only frames per gap |
+| Fast retransmit | 3 dup-ACKs resend the segment at the acked position immediately |
+| Re-ACK | a retransmission dropped by the replay window (i.e. our ACK was lost) gets an immediate ACK |
+| Retire | scan-based, not FIFO: new data is sent while old segments await retransmission |
+
+Retransmissions reuse the inner anti-replay seq, so a peer that already processed them
+drops the copy — nothing is duplicated into user data. An unpatched peer sees ordinary
+data frames, so a patched end degrades to RTO-only recovery instead of breaking.
+
+Verified on loopback at 8% netem loss: 39 retx client→server and 18 server→client on
+the wire, all payloads byte-exact, zero unresolved sequence holes. End-to-end delivery
+did **not** improve over the unpatched control (35 vs 34 of 60 probes) — in that
+topology most loss sits on the unprotected plain-UDP hop the tunnel cannot retransmit.
+The dup-ACK and fast-retransmit paths are implemented but were not observed firing in
+these tests (netem loss alone rarely reorders). The benefit on a real lossy path is not
+yet proven and needs measurement there; `tests/netem_loopback.sh` and
+`tests/analyze_capture.py` are the harness for that.
+
+## Known limitations
+
+- Loss-recovery emulation exists on `feature/tcp-loss-emulation` only; the default
+  branch still does not retransmit.
 - Any scanner can complete the fake handshake (no crypto before the handshake);
   the port looks "open but silent" to probes.
 - No padding of data packets (only heartbeats are randomized), so payload-length
