@@ -1281,7 +1281,22 @@ int send_raw_packet(raw_info_t &raw_info, const char *packet, int len) {
         // pthread_mutex_lock(&pcap_mutex); looks like this is not necessary, and it harms performance
         int ret = pcap_sendpacket(pcap_handle, (const unsigned char *)buf, len + pcap_link_header_len);
         if (ret != 0) {
-            mylog(log_warn, "pcap_sendpcaket failed with vaule %d,%s, data_len=%d\n", ret, pcap_geterr(pcap_handle), len);
+            //a frame larger than the path mtu is rejected by ndis; that is not worth
+            //a log line per packet, the upper layer has to lower its mtu anyway
+            static u64_t last_warn_time = 0;
+            static int dropped_since_warn = 0;
+            static int oversize_seen = 0;
+            dropped_since_warn++;
+            u64_t now = get_current_time() / 1000;
+            if (now - last_warn_time >= 5000) {
+                mylog(log_warn, "pcap_sendpcaket failed with vaule %d,%s, data_len=%d, dropped %d packet(s) in the last %d ms\n", ret, pcap_geterr(pcap_handle), len, dropped_since_warn, (int)(now - last_warn_time));
+                if (len + pcap_link_header_len > 1514 && oversize_seen == 0) {
+                    oversize_seen = 1;
+                    mylog(log_warn, "the frame is larger than a 1500 byte mtu: the tunnel adds %d byte(s) of link and faketcp header, lower the mtu or the quic max datagram size at the upper level\n", pcap_link_header_len + 40);
+                }
+                last_warn_time = now;
+                dropped_since_warn = 0;
+            }
             // pthread_mutex_unlock(&pcap_mutex);
             // myexit(-1);
         }
