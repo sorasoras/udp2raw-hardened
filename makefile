@@ -94,10 +94,10 @@ cygwin:git_version
 	${cc_local}   -o ${NAME}_$@          -I. ${SOURCES} pcap_wrapper.cpp ${FLAGS} -lrt -ggdb -static -O2 -D_GNU_SOURCE ${MP}
 
 mingw:git_version
-	${cc_local}   -o ${NAME}_$@         -I. ${SOURCES} pcap_wrapper.cpp ${FLAGS} -ggdb -static -O2 -lws2_32 ${MP}
+	${cc_local}   -o ${NAME}_$@         -I. ${SOURCES} pcap_wrapper.cpp ${FLAGS} -ggdb -static -O2 -lws2_32 -liphlpapi ${MP}
 
 mingw_wepoll:git_version
-	${cc_local}   -o ${NAME}_$@        -I. ${SOURCES0} pcap_wrapper.cpp ${FLAGS} -ggdb -static -O2 -DNO_LIBEV_EMBED -D_WIN32 -lev -lws2_32 ${MP}
+	${cc_local}   -o ${NAME}_$@        -I. ${SOURCES0} pcap_wrapper.cpp ${FLAGS} -ggdb -static -O2 -DNO_LIBEV_EMBED -D_WIN32 -lev -lws2_32 -liphlpapi ${MP}
 
 linux:git_version
 	${cc_local}   -o ${NAME}_$@          -I. ${SOURCES} ${PCAP} ${FLAGS} -lrt -ggdb -static -O2 ${MP}
@@ -111,10 +111,10 @@ mac:git_version
 #targets for multi-platform version (cross compile)
 
 mingw_cross:git_version
-	${cc_mingw_cross}   -o ${NAME}_mp.exe          -I. ${SOURCES} pcap_wrapper.cpp ${FLAGS} -ggdb -static -O2 -lws2_32 ${MP}
+	${cc_mingw_cross}   -o ${NAME}_mp.exe          -I. ${SOURCES} pcap_wrapper.cpp ${FLAGS} -ggdb -static -O2 -lws2_32 -liphlpapi ${MP}
 
 mingw_cross_wepoll:git_version
-	${cc_mingw_cross}   -o ${NAME}_mp_wepoll.exe   -I. ${SOURCES0} pcap_wrapper.cpp ${FLAGS} -ggdb -static -O2 -DNO_LIBEV_EMBED -D_WIN32 -lev -lws2_32 ${MP}
+	${cc_mingw_cross}   -o ${NAME}_mp_wepoll.exe   -I. ${SOURCES0} pcap_wrapper.cpp ${FLAGS} -ggdb -static -O2 -DNO_LIBEV_EMBED -D_WIN32 -lev -lws2_32 -liphlpapi ${MP}
 
 mac_cross:git_version
 	${cc_mac_cross}   -o ${NAME}_mp_mac            -I. ${SOURCES} ${PCAP} ${FLAGS} -ggdb -O2 ${MP}
