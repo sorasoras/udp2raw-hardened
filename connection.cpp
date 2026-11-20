@@ -661,9 +661,13 @@ int tcpemul_on_recv_frame(conn_info_t &conn_info) {
         return 0;  // out-of-order frame is still processed (UDP semantics)
     }
     if (seq_gt(seq + len, ackpos)) return 0;  // partial overlap: process, ack unchanged
-    // fully old: retransmission of data we already have -> re-ack
+    // Fully old outer seq, but do NOT drop it: seq_mode 3 lets the peer rewind
+    // send_info.seq to our ack when its window fills, so a frame can carry NEW
+    // payload under an old seq. Dropping here discarded real data and collapsed
+    // throughput under load. Process it; the inner anti-replay window is the
+    // only safe duplicate test (and re-acks it there).
     tcpemul_reack(conn_info);
-    return -2;
+    return 0;
 }
 
 int tcpemul_fast_retx(conn_info_t &conn_info) {
