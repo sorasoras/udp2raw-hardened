@@ -596,7 +596,11 @@ static inline int seq_lt(u32_t a, u32_t b) { return (int)(a - b) < 0; }
 static inline int seq_le(u32_t a, u32_t b) { return (int)(a - b) <= 0; }
 static inline int seq_gt(u32_t a, u32_t b) { return (int)(a - b) > 0; }
 
-static const int tcpemul_rto_base = 800;      // ms; ack cadence can reach hb interval (600 ms)
+// ACKs only ride the heartbeat (600 ms, +/-150 ms jitter), so a clean path can
+// leave a burst unacked for most of a second. An 800 ms RTO fired spuriously on
+// every burst; 2 s is >2 heartbeat periods + jitter + RTT, so an RTO now means
+// the peer's cumulative ack really stopped moving.
+static const int tcpemul_rto_base = 2000;     // ms
 static const int tcpemul_max_retries = 4;
 static const size_t tcpemul_max_buf = 192;    // unacked segment cap (< anti-replay window 4000)
 
@@ -682,6 +686,12 @@ int tcpemul_record_sent(conn_info_t &conn_info, const char *pkt, int len, u32_t 
     e.retries = 0;
     e.gave_up = 0;
     if (te.retx_q.size() >= tcpemul_max_buf) te.retx_q.pop_front();
+    if (te.retx_q.empty()) {
+        // first segment after an idle period: measure ack staleness from here,
+        // not from the last ack we saw before the connection went quiet
+        te.last_ack_progress_ms = e.first_ms;
+        te.last_ack_val = conn_info.raw_info.recv_info.ack_seq;
+    }
     te.retx_q.push_back(e);
     return 0;
 }
@@ -690,6 +700,11 @@ int tcpemul_retire_acked(conn_info_t &conn_info) {
     if (raw_mode != mode_faketcp) return 0;
     tcp_emul_t &te = conn_info.blob->tcp_emul;
     u32_t ack = conn_info.raw_info.recv_info.ack_seq;
+    u64_t now = get_current_time();
+    if (te.last_ack_progress_ms == 0 || ack != te.last_ack_val) {
+        te.last_ack_val = ack;
+        te.last_ack_progress_ms = now;
+    }
     // scan-based: entries may be out of order in the queue (new data is sent
     // while old segments await retransmission), so pop any acked entry,
     // not just the front one.
@@ -712,12 +727,13 @@ static void tcpemul_maybe_log_stats(conn_info_t &conn_info) {
         && te.stat_dupacks == te.log_dupacks && te.stat_reacks == te.log_reacks
         && te.stat_gaps == te.log_gaps && te.stat_giveup == te.log_giveup) return;
     packet_info_t &recv_info = conn_info.raw_info.recv_info;
-    mylog(log_info, "[%s:%d]tcp-emul retx=%llu fast_retx=%llu dupack=%llu reack=%llu gaps=%llu giveup=%llu inflight=%d\n",
+    u64_t ack_idle = te.last_ack_progress_ms ? now - te.last_ack_progress_ms : 0;
+    mylog(log_info, "[%s:%d]tcp-emul retx=%llu fast_retx=%llu dupack=%llu reack=%llu gaps=%llu giveup=%llu ackidle=%llums inflight=%d\n",
           recv_info.new_src_ip.get_str1(), recv_info.src_port,
           (unsigned long long)te.stat_retx, (unsigned long long)te.stat_fast_retx,
           (unsigned long long)te.stat_dupacks, (unsigned long long)te.stat_reacks,
           (unsigned long long)te.stat_gaps, (unsigned long long)te.stat_giveup,
-          (int)te.retx_q.size());
+          (unsigned long long)ack_idle, (int)te.retx_q.size());
     te.log_retx = te.stat_retx;
     te.log_fast_retx = te.stat_fast_retx;
     te.log_dupacks = te.stat_dupacks;
@@ -732,30 +748,42 @@ int tcpemul_retx_scan(conn_info_t &conn_info) {
         && conn_info.state.client_current_state != client_ready) return 0;
     tcp_emul_t &te = conn_info.blob->tcp_emul;
     u64_t now = get_current_time();
-    int sent = 0;
-    for (auto &e : te.retx_q) {
-        if (e.retries >= tcpemul_max_retries) {
-            if (!e.gave_up) {  // abandoned: peer never acked this segment
-                e.gave_up = 1;
-                te.stat_giveup++;
-            }
-            continue;
-        }
-        int rto = tcpemul_rto_base << e.retries;
-        if (now - e.last_ms < (u64_t)rto) continue;
-        u32_t saved_seq = conn_info.raw_info.send_info.seq;
-        conn_info.raw_info.send_info.seq = e.seq_start;
-        conn_info.raw_info.send_info.psh = 1;
-        if (send_raw0(conn_info.raw_info, e.pkt.data(), (int)e.pkt.size()) == 0) {
-            after_send_raw0(conn_info.raw_info);
-            e.retries++;
-            e.last_ms = now;
-            sent++;
-            te.stat_retx++;
-        }
-        conn_info.raw_info.send_info.seq = saved_seq;
-        if (sent >= 8) break;  // bound work per tick
+    if (te.retx_q.empty()) {
+        tcpemul_maybe_log_stats(conn_info);
+        return 0;
     }
+    // Cumulative acks retire in order, so only the oldest unacked segment can
+    // be blocking the peer. Retransmitting anything behind it is pure waste:
+    // the peer cannot ack past the hole anyway.
+    retx_entry_t &e = te.retx_q.front();
+    if (e.retries >= tcpemul_max_retries) {
+        if (!e.gave_up) {  // abandoned: peer never acked this segment
+            e.gave_up = 1;
+            te.stat_giveup++;
+        }
+        tcpemul_maybe_log_stats(conn_info);
+        return 0;
+    }
+    int rto = tcpemul_rto_base << e.retries;
+    u64_t ack_idle = now - (te.last_ack_progress_ms ? te.last_ack_progress_ms : e.first_ms);
+    // Loss evidence gate: an RTO only counts when the peer's cumulative ack
+    // has not moved for a full RTO, and this segment was not resent recently
+    // (fast retransmit may have just fired). On a clean path the ack advances
+    // every heartbeat, so the timer never expires and nothing is duplicated.
+    if (ack_idle < (u64_t)rto || now - e.last_ms < (u64_t)rto) {
+        tcpemul_maybe_log_stats(conn_info);
+        return 0;
+    }
+    u32_t saved_seq = conn_info.raw_info.send_info.seq;
+    conn_info.raw_info.send_info.seq = e.seq_start;
+    conn_info.raw_info.send_info.psh = 1;
+    if (send_raw0(conn_info.raw_info, e.pkt.data(), (int)e.pkt.size()) == 0) {
+        after_send_raw0(conn_info.raw_info);
+        e.retries++;
+        e.last_ms = now;
+        te.stat_retx++;
+    }
+    conn_info.raw_info.send_info.seq = saved_seq;
     tcpemul_maybe_log_stats(conn_info);
     return 0;
 }

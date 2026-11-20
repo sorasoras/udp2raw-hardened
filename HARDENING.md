@@ -112,7 +112,8 @@ That branch adds, per connection:
 
 | Mechanism | Behaviour |
 |---|---|
-| Retransmit | outgoing data frames buffered (encrypted wire bytes, cap 192); the timer resends unACKed segments at an 800 ms RTO doubling to 6.4 s, max 4 tries, with the original seq range and fresh ack/timestamp/window |
+| Retransmit | outgoing data frames buffered (encrypted wire bytes, cap 192); only the head-of-line unACKed segment is resent, with the original seq range and fresh ack/timestamp/window |
+| Loss gate | an RTO resend happens only when the peer's cumulative ACK has not moved for a full RTO (2 s, doubling, max 4 tries) and the segment was not resent within that window — a clean path never retransmits |
 | Cumulative ACK | ACK stays at the contiguous receive position; a gap holds it there while out-of-order frames are still delivered |
 | Dup-ACK | up to 5 ACK-only frames per gap |
 | Fast retransmit | 3 dup-ACKs resend the segment at the acked position immediately |
@@ -123,24 +124,29 @@ Retransmissions reuse the inner anti-replay seq, so a peer that already processe
 drops the copy — nothing is duplicated into user data. An unpatched peer sees ordinary
 data frames, so a patched end degrades to RTO-only recovery instead of breaking.
 
-Verified on loopback at 8% netem loss: 39 retx client→server and 18 server→client on
-the wire, all payloads byte-exact, zero unresolved sequence holes. End-to-end delivery
-did **not** improve over the unpatched control (35 vs 34 of 60 probes) — in that
-topology most loss sits on the unprotected plain-UDP hop the tunnel cannot retransmit.
+Verified on loopback at 8% netem loss + 25%/50% reorder: 42/60 probes echoed intact,
+zero unresolved sequence holes, and the only retransmissions on the wire were 2
+client→server; the rest of the recovery was fast retransmit on dup-ACKs (6 client,
+3 server), with `giveup=0`. A 0% control produced no emulation events at all. The
+first timer-only build of the emulation fired 39/18 RTO resends on an equivalent
+clean-ish path because ACKs only ride the 600 ms heartbeat and the old 800 ms RTO
+expired during normal bursts; the ACK-progress gate removed that entirely.
+
+(The 18/60 probe losses above sit on the unprotected plain-UDP echo hop, which the
+tunnel cannot retransmit — the sequence-coverage check, not the probe count, is the
+tunnel-layer verdict.)
 
 The first build of this branch wired the dup-ACK/re-ACK emitter only into an unused
 receive wrapper (`recv_safer_notused`), so that half of the emulation never ran; the
-counters added since make this visible. After moving it onto the live path, the same
-test at 5% loss + 25%/50% reorder (60 probes) records: client 7 RTO retx, 22 dup-ACKs,
-3 re-ACKs, 9 gaps; server 11 RTO retx + 4 fast retx, 16 dup-ACKs, 8 gaps, 1 segment
-abandoned after 4 tries. 56/60 probes echoed intact and the capture has zero unresolved
-sequence holes.
+counters added since make this visible. With the emitter on the live path but still
+on the old timer-only retransmit, a 5% loss + reorder run recorded 7/11 RTO retx and
+one abandoned segment — the behaviour the ACK-progress gate above replaced.
 
 Each connection now logs a summary at log_info, at most every 10 s and only when a
 counter changed:
 
 ```
-[203.0.113.9:29999]tcp-emul retx=11 fast_retx=4 dupack=16 reack=0 gaps=8 giveup=1 inflight=2
+[203.0.113.9:29999]tcp-emul retx=2 fast_retx=6 dupack=39 reack=0 gaps=14 giveup=0 ackidle=0ms inflight=0
 ```
 
 Run the binary with `--log-level 4` (INFO) to see it. ACK-only frames are 54 B on the

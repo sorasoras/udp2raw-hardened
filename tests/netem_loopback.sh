@@ -31,8 +31,18 @@ mkdir -p "$OUT"
 rm -f "$OUT"/capture.pcap "$OUT"/capture.txt
 
 echo "=== netem ${LOSS}% loss${EXTRA:+ + $EXTRA} on lo ==="
+# netem refuses reorder without a delay; add a small base delay automatically
+TC_EXTRA="${EXTRA:-}"
+case "$TC_EXTRA" in
+    *reorder*delay*|*delay*reorder*) ;;
+    *reorder*) TC_EXTRA="delay 10ms $TC_EXTRA" ;;
+esac
 tc qdisc del dev lo root 2>/dev/null
-tc qdisc add dev lo root netem loss "${LOSS}%" ${EXTRA:-}
+if ! tc qdisc add dev lo root netem loss "${LOSS}%" $TC_EXTRA; then
+    echo "FATAL: could not install netem qdisc (test would run on a clean path)" >&2
+    exit 1
+fi
+tc qdisc show dev lo | grep -q netem || { echo "FATAL: netem qdisc missing" >&2; exit 1; }
 
 python3 - "$ECHO" <<'PY' >"$OUT"/echo.log 2>&1 &
 import socket, sys
@@ -91,4 +101,4 @@ tc qdisc del dev lo root 2>/dev/null
 
 echo "=== capture analysis ==="
 tcpdump -nr "$OUT"/capture.pcap -S 2>/dev/null >"$OUT"/capture.txt
-"$(dirname "$0")"/analyze_capture.py "$OUT"/capture.txt $SPORT
+python3 "$(dirname "$0")"/analyze_capture.py "$OUT"/capture.txt $SPORT
