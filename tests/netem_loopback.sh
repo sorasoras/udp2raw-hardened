@@ -6,6 +6,7 @@
 # sequence coverage.
 #
 # Usage: sudo ./netem_loopback.sh /path/to/udp2raw [loss_percent]
+#        EXTRA="reorder 25% 50%" sudo -E ./netem_loopback.sh /path/to/udp2raw 2
 #
 # Notes:
 #  - needs root (raw sockets + tc + tcpdump)
@@ -13,6 +14,9 @@
 #    tunnel, so end-to-end delivery counts under heavy loss include loss on
 #    that unprotected hop. Use the capture analysis (not the echo count) to
 #    judge whether the tunnel layer recovers its own holes.
+#  - loss alone rarely reorders, so the dup-ACK / fast-retransmit paths need
+#    EXTRA="reorder 25% 50%". The definitive counters are the "tcp-emul"
+#    stats lines in client.log/server.log (run the binary at --log-level 4).
 set +e
 
 BIN=${1:?usage: $0 /path/to/udp2raw [loss_percent]}
@@ -26,9 +30,9 @@ OUT=${OUT:-/tmp/tcpemul-test}
 mkdir -p "$OUT"
 rm -f "$OUT"/capture.pcap "$OUT"/capture.txt
 
-echo "=== netem ${LOSS}% loss on lo ==="
+echo "=== netem ${LOSS}% loss${EXTRA:+ + $EXTRA} on lo ==="
 tc qdisc del dev lo root 2>/dev/null
-tc qdisc add dev lo root netem loss "${LOSS}%"
+tc qdisc add dev lo root netem loss "${LOSS}%" ${EXTRA:-}
 
 python3 - "$ECHO" <<'PY' >"$OUT"/echo.log 2>&1 &
 import socket, sys
@@ -47,13 +51,13 @@ ECHO_PID=$!
 
 "$BIN" -s -l 127.0.0.1:$SPORT -r 127.0.0.1:$ECHO -k "$KEY" \
     --auth-mode hmac_sha1 --cipher-mode aes128cbc --raw-mode faketcp \
-    --fix-gro --mtu-warn 1500 --log-level 2 -a >"$OUT"/server.log 2>&1 &
+    --fix-gro --mtu-warn 1500 --log-level "${LOG_LEVEL:-4}" -a >"$OUT"/server.log 2>&1 &
 SRV_PID=$!
 sleep 2
 
 "$BIN" -c -l 127.0.0.1:$CPORT -r 127.0.0.1:$SPORT -k "$KEY" \
     --auth-mode hmac_sha1 --cipher-mode aes128cbc --raw-mode faketcp \
-    --fix-gro --mtu-warn 1500 --log-level 2 -a >"$OUT"/client.log 2>&1 &
+    --fix-gro --mtu-warn 1500 --log-level "${LOG_LEVEL:-4}" -a >"$OUT"/client.log 2>&1 &
 CLI_PID=$!
 sleep 3
 

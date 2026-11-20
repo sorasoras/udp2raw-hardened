@@ -197,6 +197,7 @@ int clear_inactive0(char * ip_port);*/
         u32_t seq_end;          // exclusive
         u64_t first_ms, last_ms;
         int retries;
+        int gave_up;  // counted in stat_giveup once retries hit the cap
 };
 struct tcp_emul_t {
         // receiver side (cumulative ack)
@@ -206,10 +207,27 @@ struct tcp_emul_t {
         int gap_dups;
         // sender side
         std::deque<retx_entry_t> retx_q;
-        tcp_emul_t() { rcv_nxt = 0; rcv_valid = 0; gap_base = 0; gap_dups = 0; }
+        // counters, reported periodically at log_info (tcpemul_maybe_log_stats)
+        u64_t stat_retx;       // RTO retransmissions sent
+        u64_t stat_fast_retx;  // fast retransmissions sent
+        u64_t stat_dupacks;    // dup-ACKs sent to the peer
+        u64_t stat_reacks;     // re-ACKs sent on duplicate data
+        u64_t stat_gaps;       // out-of-order gaps observed
+        u64_t stat_giveup;     // segments abandoned after max retries
+        u64_t stat_last_log_ms;
+        u64_t log_retx, log_fast_retx, log_dupacks, log_reacks, log_gaps, log_giveup;
+        tcp_emul_t() {
+            rcv_nxt = 0; rcv_valid = 0; gap_base = 0; gap_dups = 0;
+            stat_retx = stat_fast_retx = stat_dupacks = stat_reacks = 0;
+            stat_gaps = stat_giveup = stat_last_log_ms = 0;
+            log_retx = log_fast_retx = log_dupacks = log_reacks = log_gaps = log_giveup = 0;
+        }
         void re_init() {
             rcv_nxt = 0; rcv_valid = 0; gap_base = 0; gap_dups = 0;
             retx_q.clear();
+            stat_retx = stat_fast_retx = stat_dupacks = stat_reacks = 0;
+            stat_gaps = stat_giveup = stat_last_log_ms = 0;
+            log_retx = log_fast_retx = log_dupacks = log_reacks = log_gaps = log_giveup = 0;
         }
 };
 

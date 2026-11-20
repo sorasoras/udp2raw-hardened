@@ -18,7 +18,11 @@ PAT = re.compile(
     r'seq (\d+)(?::(\d+))?, ack (\d+), win (\d+)'
     r'(?:, options \[[^\]]*\])?(?:, length (\d+))?')
 
-DATA_MIN = 21  # frames at or below this size are hb/ack carriers in practice
+# Upstream heuristic. In this fork an ACK-only frame is 54 B on the wire
+# (AES padding + HMAC) -- the same size as a small data frame -- so the
+# "small-frame ack" metric below cannot see dup-ACKs; use the tcp-emul
+# counters in the logs instead.
+DATA_MIN = 21
 
 
 def parse(path):

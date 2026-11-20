@@ -127,10 +127,27 @@ Verified on loopback at 8% netem loss: 39 retx client→server and 18 server→c
 the wire, all payloads byte-exact, zero unresolved sequence holes. End-to-end delivery
 did **not** improve over the unpatched control (35 vs 34 of 60 probes) — in that
 topology most loss sits on the unprotected plain-UDP hop the tunnel cannot retransmit.
-The dup-ACK and fast-retransmit paths are implemented but were not observed firing in
-these tests (netem loss alone rarely reorders). The benefit on a real lossy path is not
-yet proven and needs measurement there; `tests/netem_loopback.sh` and
-`tests/analyze_capture.py` are the harness for that.
+
+The first build of this branch wired the dup-ACK/re-ACK emitter only into an unused
+receive wrapper (`recv_safer_notused`), so that half of the emulation never ran; the
+counters added since make this visible. After moving it onto the live path, the same
+test at 5% loss + 25%/50% reorder (60 probes) records: client 7 RTO retx, 22 dup-ACKs,
+3 re-ACKs, 9 gaps; server 11 RTO retx + 4 fast retx, 16 dup-ACKs, 8 gaps, 1 segment
+abandoned after 4 tries. 56/60 probes echoed intact and the capture has zero unresolved
+sequence holes.
+
+Each connection now logs a summary at log_info, at most every 10 s and only when a
+counter changed:
+
+```
+[203.0.113.9:29999]tcp-emul retx=11 fast_retx=4 dupack=16 reack=0 gaps=8 giveup=1 inflight=2
+```
+
+Run the binary with `--log-level 4` (INFO) to see it. ACK-only frames are 54 B on the
+wire (AES padding + HMAC) — the same size as small data frames — so capture heuristics
+cannot count dup-ACKs; the counters are the reliable measure. The benefit on a real
+lossy path is still unproven and needs measurement there; `tests/netem_loopback.sh`
+and `tests/analyze_capture.py` are the harness.
 
 ## Known limitations
 

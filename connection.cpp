@@ -509,10 +509,15 @@ int reserved_parse_safer(conn_info_t &conn_info, const char *input, int input_le
 
     if (conn_info.blob->anti_replay.is_vaild(h_seq) != 1) {
         mylog(log_debug, "dropped replay packet\n");
-        // hardened fork: a replay-window drop of a data packet means our
-        // ack was lost and the peer retransmitted. re-ack so it stops.
-        if (conn_info.blob->tcp_emul.rcv_valid && seq_le(h_seq, conn_info.blob->tcp_emul.rcv_nxt)) {
-            return -2;
+        // hardened fork: a duplicate the replay window rejects is a
+        // retransmission of bytes we already delivered, i.e. our earlier ACK
+        // was lost. re-ack immediately so the peer retires the segment
+        // instead of backing off to the RTO cap.
+        packet_info_t &r_info = conn_info.raw_info.recv_info;
+        packet_info_t &s_info = conn_info.raw_info.send_info;
+        if (raw_mode == mode_faketcp && r_info.data_len != 0
+            && seq_le(r_info.seq + r_info.data_len, s_info.ack_seq)) {
+            if (tcpemul_send_ack(conn_info) == 0) conn_info.blob->tcp_emul.stat_reacks++;
         }
         return -1;
     }
@@ -606,6 +611,10 @@ int tcpemul_on_recv_frame(conn_info_t &conn_info) {
     // receive position as of the previous frame (mode 3 advances it in-order only).
     if (raw_mode != mode_faketcp) return 0;
     if (seq_mode != 3 && seq_mode != 4) return 0;
+    int ready = (program_mode == client_mode)
+                    ? conn_info.state.client_current_state == client_ready
+                    : conn_info.state.server_current_state == server_ready;
+    if (!ready) return 0;  // handshake frames have their own seq rules
     packet_info_t &recv_info = conn_info.raw_info.recv_info;
     packet_info_t &send_info = conn_info.raw_info.send_info;
     tcp_emul_t &te = conn_info.blob->tcp_emul;
@@ -613,18 +622,28 @@ int tcpemul_on_recv_frame(conn_info_t &conn_info) {
     u32_t len = (u32_t)recv_info.data_len;
     if (len == 0) return 0;  // pure ack carrier
     u32_t ackpos = send_info.ack_seq;
-    if (!seq_gt(seq, ackpos) && !seq_lt(seq, ackpos)) return 0;  // in order (seq == ackpos)
+    if (seq == ackpos) {  // in order: contiguous receive position moves up
+        te.rcv_nxt = seq + len;
+        te.rcv_valid = 1;
+        return 0;
+    }
     if (seq_gt(seq, ackpos)) {    // gap ahead of us
-        if (te.gap_base != ackpos) { te.gap_base = ackpos; te.gap_dups = 0; }
+        if (te.gap_base != ackpos) {
+            te.gap_base = ackpos;
+            te.gap_dups = 0;
+            te.stat_gaps++;
+        }
         if (te.gap_dups < 5) {
-            tcpemul_send_ack(conn_info);   // dup-ack: ack stays at the gap position
-            te.gap_dups++;
+            if (tcpemul_send_ack(conn_info) == 0) {  // dup-ack: ack stays at the gap
+                te.stat_dupacks++;
+                te.gap_dups++;
+            }
         }
         return 0;  // out-of-order frame is still processed (UDP semantics)
     }
     if (seq_gt(seq + len, ackpos)) return 0;  // partial overlap: process, ack unchanged
     // fully old: retransmission of data we already have -> re-ack
-    tcpemul_send_ack(conn_info);
+    if (tcpemul_send_ack(conn_info) == 0) te.stat_reacks++;
     return -2;
 }
 
@@ -641,7 +660,10 @@ int tcpemul_fast_retx(conn_info_t &conn_info) {
     conn_info.raw_info.send_info.seq = e.seq_start;
     conn_info.raw_info.send_info.psh = 1;
     int r = send_raw0(conn_info.raw_info, e.pkt.data(), (int)e.pkt.size());
-    if (r == 0) after_send_raw0(conn_info.raw_info);
+    if (r == 0) {
+        after_send_raw0(conn_info.raw_info);
+        te.stat_fast_retx++;
+    }
     conn_info.raw_info.send_info.seq = saved_seq;
     e.retries++;
     e.last_ms = now;
@@ -658,6 +680,7 @@ int tcpemul_record_sent(conn_info_t &conn_info, const char *pkt, int len, u32_t 
     e.seq_end = seq_start + (u32_t)len;
     e.first_ms = e.last_ms = get_current_time();
     e.retries = 0;
+    e.gave_up = 0;
     if (te.retx_q.size() >= tcpemul_max_buf) te.retx_q.pop_front();
     te.retx_q.push_back(e);
     return 0;
@@ -677,6 +700,32 @@ int tcpemul_retire_acked(conn_info_t &conn_info) {
     return 0;
 }
 
+// Report emulation activity at log_info no more than every 10 s, and only if
+// something happened. This is the only visibility into the emulation: it emits
+// no per-packet logs (that would be a packet-rate log flood).
+static void tcpemul_maybe_log_stats(conn_info_t &conn_info) {
+    tcp_emul_t &te = conn_info.blob->tcp_emul;
+    u64_t now = get_current_time();
+    if (te.stat_last_log_ms != 0 && now - te.stat_last_log_ms < 10000) return;
+    te.stat_last_log_ms = now;
+    if (te.stat_retx == te.log_retx && te.stat_fast_retx == te.log_fast_retx
+        && te.stat_dupacks == te.log_dupacks && te.stat_reacks == te.log_reacks
+        && te.stat_gaps == te.log_gaps && te.stat_giveup == te.log_giveup) return;
+    packet_info_t &recv_info = conn_info.raw_info.recv_info;
+    mylog(log_info, "[%s:%d]tcp-emul retx=%llu fast_retx=%llu dupack=%llu reack=%llu gaps=%llu giveup=%llu inflight=%d\n",
+          recv_info.new_src_ip.get_str1(), recv_info.src_port,
+          (unsigned long long)te.stat_retx, (unsigned long long)te.stat_fast_retx,
+          (unsigned long long)te.stat_dupacks, (unsigned long long)te.stat_reacks,
+          (unsigned long long)te.stat_gaps, (unsigned long long)te.stat_giveup,
+          (int)te.retx_q.size());
+    te.log_retx = te.stat_retx;
+    te.log_fast_retx = te.stat_fast_retx;
+    te.log_dupacks = te.stat_dupacks;
+    te.log_reacks = te.stat_reacks;
+    te.log_gaps = te.stat_gaps;
+    te.log_giveup = te.stat_giveup;
+}
+
 int tcpemul_retx_scan(conn_info_t &conn_info) {
     if (raw_mode != mode_faketcp) return 0;
     if (conn_info.state.server_current_state != server_ready
@@ -685,7 +734,13 @@ int tcpemul_retx_scan(conn_info_t &conn_info) {
     u64_t now = get_current_time();
     int sent = 0;
     for (auto &e : te.retx_q) {
-        if (e.retries >= tcpemul_max_retries) continue;
+        if (e.retries >= tcpemul_max_retries) {
+            if (!e.gave_up) {  // abandoned: peer never acked this segment
+                e.gave_up = 1;
+                te.stat_giveup++;
+            }
+            continue;
+        }
         int rto = tcpemul_rto_base << e.retries;
         if (now - e.last_ms < (u64_t)rto) continue;
         u32_t saved_seq = conn_info.raw_info.send_info.seq;
@@ -696,10 +751,12 @@ int tcpemul_retx_scan(conn_info_t &conn_info) {
             e.retries++;
             e.last_ms = now;
             sent++;
+            te.stat_retx++;
         }
         conn_info.raw_info.send_info.seq = saved_seq;
         if (sent >= 8) break;  // bound work per tick
     }
+    tcpemul_maybe_log_stats(conn_info);
     return 0;
 }
 // ===============================================================================
@@ -714,6 +771,9 @@ int recv_safer_multi(conn_info_t &conn_info, vector<char> &type_arr, vector<stri
     assert(data_arr.empty());
 
     if (recv_raw0(conn_info.raw_info, recv_data, recv_len) != 0) return -1;
+    // receiver-side emulation must run before reserved_parse_safer, whose
+    // after_recv_raw0() advances the cumulative ack position for in-order data
+    if (tcpemul_on_recv_frame(conn_info) == -2) return 0;  // fully-old frame: re-acked, skip parse
 
     char type;
     char *data;
