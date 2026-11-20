@@ -59,6 +59,15 @@ The upstream Windows path had three bugs that each broke or weakened the client:
 `-fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE -pie -Wformat -Wformat-security
 -fno-plt -fvisibility=hidden`, release builds stripped.
 
+ARM64 builds can use the ARMv8-A crypto extension for AES-CBC:
+
+```
+make arm64_hw_aes cc_arm64=aarch64-linux-gnu-g++
+```
+
+The binary probes `HWCAP_AES` at runtime and falls back to the constant-time
+vpaes implementation when the CPU lacks the crypto extension.
+
 ## Compatibility
 
 - **All stealth changes are wire-format-compatible with unpatched peers**, except
