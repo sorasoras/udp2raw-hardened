@@ -10,6 +10,7 @@ static inline int seq_lt(u32_t a, u32_t b);
 static inline int seq_le(u32_t a, u32_t b);
 static inline int seq_gt(u32_t a, u32_t b);
 int tcpemul_send_ack(conn_info_t &conn_info);
+static int tcpemul_reack(conn_info_t &conn_info);
 int tcpemul_on_recv_frame(conn_info_t &conn_info);
 int tcpemul_record_sent(conn_info_t &conn_info, const char *pkt, int len, u32_t seq_start);
 int tcpemul_retire_acked(conn_info_t &conn_info);
@@ -517,7 +518,7 @@ int reserved_parse_safer(conn_info_t &conn_info, const char *input, int input_le
         packet_info_t &s_info = conn_info.raw_info.send_info;
         if (raw_mode == mode_faketcp && r_info.data_len != 0
             && seq_le(r_info.seq + r_info.data_len, s_info.ack_seq)) {
-            if (tcpemul_send_ack(conn_info) == 0) conn_info.blob->tcp_emul.stat_reacks++;
+            tcpemul_reack(conn_info);  // rate-limited: see tcpemul_reack
         }
         return -1;
     }
@@ -610,6 +611,20 @@ int tcpemul_send_ack(conn_info_t &conn_info) {
     return send_safer(conn_info, 'h', 0, 0);
 }
 
+// Re-ACK a duplicate frame, at most once per 100 ms. A real TCP sends one
+// dup-ACK per out-of-order segment, not one per duplicate byte; without this
+// cap a burst of retransmissions from the peer turns the return path into an
+// ACK flood (measured: 2-5 re-ACKs per data frame on a lossy mobile path).
+static int tcpemul_reack(conn_info_t &conn_info) {
+    tcp_emul_t &te = conn_info.blob->tcp_emul;
+    u64_t now = get_current_time();
+    if (te.last_reack_ms != 0 && now - te.last_reack_ms < 100) return -1;
+    if (tcpemul_send_ack(conn_info) != 0) return -1;
+    te.last_reack_ms = now;
+    te.stat_reacks++;
+    return 0;
+}
+
 int tcpemul_on_recv_frame(conn_info_t &conn_info) {
     // runs BEFORE after_recv_raw0, so send_info.ack_seq is still the contiguous
     // receive position as of the previous frame (mode 3 advances it in-order only).
@@ -647,7 +662,7 @@ int tcpemul_on_recv_frame(conn_info_t &conn_info) {
     }
     if (seq_gt(seq + len, ackpos)) return 0;  // partial overlap: process, ack unchanged
     // fully old: retransmission of data we already have -> re-ack
-    if (tcpemul_send_ack(conn_info) == 0) te.stat_reacks++;
+    tcpemul_reack(conn_info);
     return -2;
 }
 

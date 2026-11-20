@@ -117,7 +117,7 @@ That branch adds, per connection:
 | Cumulative ACK | ACK stays at the contiguous receive position; a gap holds it there while out-of-order frames are still delivered |
 | Dup-ACK | up to 5 ACK-only frames per gap |
 | Fast retransmit | 3 dup-ACKs resend the segment at the acked position immediately |
-| Re-ACK | a retransmission dropped by the replay window (i.e. our ACK was lost) gets an immediate ACK |
+| Re-ACK | a retransmission dropped by the replay window (i.e. our ACK was lost) gets an ACK, at most one per 100 ms — a real TCP sends one dup-ACK per segment, not per duplicate byte |
 | Retire | scan-based, not FIFO: new data is sent while old segments await retransmission |
 
 Retransmissions reuse the inner anti-replay seq, so a peer that already processed them

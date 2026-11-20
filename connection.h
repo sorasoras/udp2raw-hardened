@@ -209,6 +209,7 @@ struct tcp_emul_t {
         std::deque<retx_entry_t> retx_q;
         u64_t last_ack_progress_ms;  // last time the peer's cumulative ack moved
         u32_t last_ack_val;
+        u64_t last_reack_ms;         // rate limit for re-ACKs
         // counters, reported periodically at log_info (tcpemul_maybe_log_stats)
         u64_t stat_retx;       // RTO retransmissions sent
         u64_t stat_fast_retx;  // fast retransmissions sent
@@ -221,6 +222,7 @@ struct tcp_emul_t {
         tcp_emul_t() {
             rcv_nxt = 0; rcv_valid = 0; gap_base = 0; gap_dups = 0;
             last_ack_progress_ms = 0; last_ack_val = 0;
+            last_reack_ms = 0;
             stat_retx = stat_fast_retx = stat_dupacks = stat_reacks = 0;
             stat_gaps = stat_giveup = stat_last_log_ms = 0;
             log_retx = log_fast_retx = log_dupacks = log_reacks = log_gaps = log_giveup = 0;
@@ -229,6 +231,7 @@ struct tcp_emul_t {
             rcv_nxt = 0; rcv_valid = 0; gap_base = 0; gap_dups = 0;
             retx_q.clear();
             last_ack_progress_ms = 0; last_ack_val = 0;
+            last_reack_ms = 0;
             stat_retx = stat_fast_retx = stat_dupacks = stat_reacks = 0;
             stat_gaps = stat_giveup = stat_last_log_ms = 0;
             log_retx = log_fast_retx = log_dupacks = log_reacks = log_gaps = log_giveup = 0;
