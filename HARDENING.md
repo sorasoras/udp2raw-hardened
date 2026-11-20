@@ -124,6 +124,13 @@ Retransmissions reuse the inner anti-replay seq, so a peer that already processe
 drops the copy — nothing is duplicated into user data. An unpatched peer sees ordinary
 data frames, so a patched end degrades to RTO-only recovery instead of breaking.
 
+The outer fake-TCP seq is cosmetic and must never gate delivery: seq_mode 3 rewinds
+`send_info.seq` to the peer's ACK when the emulated window fills, so a frame can carry
+new payload under an old seq. Frames behind the current ACK are therefore decrypted
+and processed like any other; only the inner anti-replay window may drop a duplicate.
+(An earlier build dropped them on the outer seq and lost real data under load — live
+throughput fell from ~1.5 MB/s to tens of KB/s.)
+
 Verified on loopback at 8% netem loss + 25%/50% reorder: 42/60 probes echoed intact,
 zero unresolved sequence holes, and the only retransmissions on the wire were 2
 client→server; the rest of the recovery was fast retransmit on dup-ACKs (6 client,
